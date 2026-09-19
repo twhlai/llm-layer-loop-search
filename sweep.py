@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-RYS Layer Duplication Sweep
+RYS Looped Layer Evaluator
 
-Orchestrates the search for optimal layer duplication configuration:
-1. Generate modified GGUF with duplicated layers
+Systematically evaluates looped attention layer configurations from
+list of candidate layers:
+1. Generate modified GGUF with looped layers
 2. Start llama-server with the modified model
 3. Run math + EQ probes
 4. Score and record results
@@ -15,26 +16,20 @@ Usage:
         --model /path/to/model.gguf \
         --llama-server /path/to/llama-server \
         --tmpdir /dev/shm/rys \
+        --candidates 8..24 \
         --results results.jsonl
-
-The sweep strategy:
-    Pass 1: 8-layer blocks at stride 4 across the middle
-    Pass 2: Refine within the hot zone with smaller blocks
 """
 
 import argparse
+import itertools
 import json
-import os
-import signal
-import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
-import requests
-
-from gguf_surgery import duplicate_layers
+from gguf_surgery import build_gguf_from_path
+from layer_path import parse_layer_list
+from ls_utils import wait_for_server, start_server, stop_server, dump_server_log, query_model
 from math_probe import MATH_QUESTIONS, score_math_response
 from eq_probe import EQ_SCENARIOS, build_eq_prompt, parse_eq_response, score_eq_response
 from reasoning_probe import REASONING_QUESTIONS, score_reasoning_response
@@ -42,105 +37,6 @@ from reasoning_probe import REASONING_QUESTIONS, score_reasoning_response
 
 # Server config
 DEFAULT_PORT = 8099
-SERVER_STARTUP_TIMEOUT = 120  # seconds
-REQUEST_TIMEOUT = 60  # seconds per completion
-
-
-def wait_for_server(port: int, timeout: int = SERVER_STARTUP_TIMEOUT) -> bool:
-    """Wait for llama-server to be ready."""
-    url = f"http://127.0.0.1:{port}/health"
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(url, timeout=2)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("status") == "ok":
-                    return True
-        except (requests.ConnectionError, requests.Timeout):
-            pass
-        time.sleep(1)
-    return False
-
-
-def start_server(llama_server_path: str, model_path: str, port: int,
-                 extra_args: list[str] = None) -> subprocess.Popen:
-    """Start llama-server and return the process handle."""
-    cmd = [
-        llama_server_path,
-        "-m", model_path,
-        "--port", str(port),
-        "-c", "4096",           # small context for probe eval
-        "-ngl", "99",           # offload all layers to GPU
-        "--flash-attn", "on",
-        "--cache-type-k", "q8_0",
-        "--cache-type-v", "q8_0",
-        "--no-warmup",
-        "-np", "1",             # single slot
-    ]
-    if extra_args:
-        cmd.extend(extra_args)
-
-    print(f"  [CMD] {' '.join(cmd)}", flush=True)
-
-    # Let server output go to a log file so we can debug without pipe deadlocks
-    log_path = Path(f"/tmp/rys_server_{port}.log")
-    log_file = open(log_path, "w")
-    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-    proc._log_file = log_file  # keep reference so it doesn't get GC'd
-    proc._log_path = log_path
-    print(f"  [PID] Server started as PID {proc.pid}, log: {log_path}", flush=True)
-    return proc
-
-
-def stop_server(proc: subprocess.Popen):
-    """Gracefully stop the server."""
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    # Close the log file
-    if hasattr(proc, '_log_file'):
-        proc._log_file.close()
-
-
-def dump_server_log(proc: subprocess.Popen, tail_lines: int = 30):
-    """Print the last N lines of the server log for debugging."""
-    if hasattr(proc, '_log_path') and proc._log_path.exists():
-        lines = proc._log_path.read_text().splitlines()
-        print(f"  --- Server log (last {tail_lines} lines) ---", file=sys.stderr)
-        for line in lines[-tail_lines:]:
-            print(f"  | {line}", file=sys.stderr)
-        print(f"  --- End server log ---", file=sys.stderr)
-
-
-def query_model(prompt: str, port: int, max_tokens: int = 64) -> str | None:
-    """Send a completion request to llama-server."""
-    url = f"http://127.0.0.1:{port}/v1/chat/completions"
-
-    payload = {
-        "model": "test",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-    }
-
-    try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
-        else:
-            print(f"  [WARN] Server returned {r.status_code}", file=sys.stderr)
-            return None
-    except (requests.ConnectionError, requests.Timeout) as e:
-        print(f"  [WARN] Request failed: {e}", file=sys.stderr)
-        return None
 
 
 def run_math_probe(port: int) -> float:
@@ -209,21 +105,21 @@ def run_evaluation(port: int) -> dict:
 
 def print_results_table(results: list[dict], baseline: dict | None = None):
     """Print a live-updating results table."""
-    print("\n" + "=" * 105)
-    print(f"{'Config':>12} {'Layers':>8} {'Math':>8} {'EQ':>8} {'Reason':>8} "
+    width = 90
+    print("\n" + "=" * width)
+    print(f"{'Config':>14} {'Math':>8} {'EQ':>8} {'Reason':>8} "
           f"{'Math Δ':>8} {'EQ Δ':>8} {'Reas Δ':>8} {'Combined Δ':>11}")
-    print("-" * 105)
+    print("-" * width)
 
     if baseline:
         brs = baseline.get('reasoning_score', 0)
-        print(f"{'BASELINE':>12} {'0':>8} "
+        print(f"{'BASELINE':>14} "
               f"{baseline['math_score']:>8.4f} {baseline['eq_score']:>8.2f} {brs:>8.2%} "
               f"{'---':>8} {'---':>8} {'---':>8} {'---':>11}")
-        print("-" * 105)
+        print("-" * width)
 
     for r in results:
-        config = f"({r['dup_start']},{r['dup_end']})"
-        n_dup = r['dup_end'] - r['dup_start']
+        config = f"{set(r['repeat_layers'])}x{r['repeat_factor']}"
         rs = r.get('reasoning_score', 0)
 
         if baseline:
@@ -236,45 +132,30 @@ def print_results_table(results: list[dict], baseline: dict | None = None):
             eq_d = f"{eq_delta:>+8.2f}"
             reas_d = f"{reas_delta:>+8.2%}"
             comb_d = f"{combined:>+11.2f}"
+            all_pos = "*" if math_delta > 0 and eq_delta > 0 and reas_delta > 0 else " "
         else:
             math_d = eq_d = reas_d = comb_d = "---"
+            all_pos = " "
 
-        print(f"{config:>12} {n_dup:>8} "
+        print(f"{config:>14} "
               f"{r['math_score']:>8.4f} {r['eq_score']:>8.2f} {rs:>8.2%} "
-              f"{math_d} {eq_d} {reas_d} {comb_d}")
+              f"{math_d} {eq_d} {reas_d} {comb_d}  {all_pos}")
 
-    print("=" * 105)
+    print("=" * width)
     sys.stdout.flush()
 
 
-def generate_sweep_configs(n_layers: int, block_sizes: list[int],
-                           start_min: int = 4, start_max: int = None,
-                           stride: int = 4) -> list[tuple[int, int]]:
-    """
-    Generate (dup_start, dup_end) configs for the sweep.
-
-    Args:
-        n_layers: Total layers in the model
-        block_sizes: List of block sizes to try (e.g., [8])
-        start_min: Earliest layer to start duplication
-        start_max: Latest layer to start (default: n_layers - max(block_sizes) - 4)
-        stride: Step between start positions
-    """
-    if start_max is None:
-        start_max = n_layers - max(block_sizes) - 4
-
-    configs = []
-    for bs in block_sizes:
-        for start in range(start_min, start_max + 1, stride):
-            end = start + bs
-            if end <= n_layers:
-                configs.append((start, end))
-
-    return configs
+def generate_layer_path(n_layers: int, layer_subset: tuple[int,...], repeat_factor: int) -> list[int]:
+    new_list = []
+    for i in range(n_layers):
+        if i in layer_subset:
+            new_list.extend([-i] * (repeat_factor-1))
+        new_list.append(i)
+    return new_list
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RYS Layer Duplication Sweep")
+    parser = argparse.ArgumentParser(description="RYS Looped Layer Evaluator")
     parser.add_argument("--model", required=True, help="Path to input GGUF model")
     parser.add_argument("--llama-server", required=True, help="Path to llama-server binary")
     parser.add_argument("--tmpdir", default="/dev/shm/rys",
@@ -282,14 +163,11 @@ def main():
     parser.add_argument("--results", default="rys_results.jsonl",
                         help="Output results file (JSONL)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--block-sizes", type=int, nargs="+", default=[8],
-                        help="Block sizes to sweep (default: 8)")
-    parser.add_argument("--stride", type=int, default=4,
-                        help="Stride between start positions (default: 4)")
-    parser.add_argument("--start-min", type=int, default=4,
-                        help="Earliest layer to start duplication")
-    parser.add_argument("--start-max", type=int, default=None,
-                        help="Latest layer to start duplication")
+    parser.add_argument("--candidates", required=True, help="List of candidate layers to evaluate")
+    parser.add_argument("--num-loops", type=int, default=1,
+                        help="Number of looped single layers to include")
+    parser.add_argument("--repeat-factor", type=int, default=2,
+                        help="Number of times layer attention is repeated")
     parser.add_argument("--skip-baseline", action="store_true",
                         help="Skip baseline run (use if already in results)")
     parser.add_argument("--server-args", nargs=argparse.REMAINDER, default=[],
@@ -299,6 +177,7 @@ def main():
     model_path = Path(args.model).resolve()
     tmpdir = Path(args.tmpdir)
     tmpdir.mkdir(parents=True, exist_ok=True)
+    candidate_list = parse_layer_list(args.candidates)
 
     results_path = Path(args.results)
     results = []
@@ -320,7 +199,7 @@ def main():
     # Run baseline (unmodified model)
     if not args.skip_baseline and baseline is None:
         print("\n>>> Running BASELINE evaluation...")
-        proc = start_server(args.llama_server, str(model_path), args.port, args.server_args)
+        proc = start_server(args.llama_server, str(model_path), tmpdir, args.port, args.server_args)
         try:
             if not wait_for_server(args.port):
                 print("ERROR: Server failed to start for baseline", file=sys.stderr)
@@ -332,8 +211,6 @@ def main():
             eval_result = run_evaluation(args.port)
             baseline = {
                 "is_baseline": True,
-                "dup_start": -1,
-                "dup_end": -1,
                 "math_score": eval_result["math_score"],
                 "eq_score": eval_result["eq_score"],
                 "reasoning_score": eval_result["reasoning_score"],
@@ -360,37 +237,28 @@ def main():
     print(f"Architecture: {arch}, Layers: {n_layers}")
 
     # Generate sweep configurations
-    configs = generate_sweep_configs(
-        n_layers=n_layers,
-        block_sizes=args.block_sizes,
-        start_min=args.start_min,
-        start_max=args.start_max,
-        stride=args.stride,
-    )
+    configs = list(itertools.combinations(candidate_list, args.num_loops))
 
     # Filter out already-completed configs
-    done = {(r["dup_start"], r["dup_end"]) for r in results}
-    configs = [(s, e) for s, e in configs if (s, e) not in done]
+    done = {tuple(r["repeat_layers"]) for r in results}
+    configs = [c for c in configs if c not in done]
 
     print(f"Configs to test: {len(configs)}")
-    if configs:
-        print(f"  Range: ({configs[0][0]},{configs[0][1]}) to ({configs[-1][0]},{configs[-1][1]})")
 
     print_results_table(results, baseline)
 
-    for idx, (dup_start, dup_end) in enumerate(configs):
-        n_dup = dup_end - dup_start
-        config_str = f"({dup_start},{dup_end})"
-        print(f"\n>>> [{idx+1}/{len(configs)}] Testing config {config_str} "
-              f"(+{n_dup} layers)...")
+    for layer_subset in configs:
+        config_str = f"{str(layer_subset).replace(" ","")}x{args.repeat_factor}"
+        print(f"\n>>> Testing config {config_str}")
 
         # Generate modified GGUF
-        modified_path = tmpdir / f"rys_{dup_start}_{dup_end}.gguf"
+        modified_path = tmpdir / f"rys_{config_str}.gguf"
         print(f"  Generating modified GGUF...")
         try:
-            duplicate_layers(
+            layer_path = generate_layer_path(n_layers, layer_subset, args.repeat_factor)
+            build_gguf_from_path(
                 str(model_path), str(modified_path),
-                dup_start, dup_end, verbose=False
+                layer_path, verbose=False
             )
         except Exception as e:
             print(f"  ERROR generating GGUF: {e}", file=sys.stderr)
@@ -399,7 +267,7 @@ def main():
         # Start server with modified model
         print(f"  Starting server...")
         proc = start_server(
-            args.llama_server, str(modified_path), args.port, args.server_args
+            args.llama_server, str(modified_path), tmpdir, args.port, args.server_args
         )
 
         try:
@@ -413,9 +281,8 @@ def main():
             eval_result = run_evaluation(args.port)
 
             entry = {
-                "dup_start": dup_start,
-                "dup_end": dup_end,
-                "n_dup_layers": n_dup,
+                "repeat_layers": layer_subset,
+                "repeat_factor": args.repeat_factor,
                 "math_score": eval_result["math_score"],
                 "eq_score": eval_result["eq_score"],
                 "reasoning_score": eval_result["reasoning_score"],
