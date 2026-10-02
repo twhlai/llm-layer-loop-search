@@ -19,7 +19,7 @@ I didn't test my code on any hybrid or MoE LLMs, but it ran fine on Mistral Nemo
 ### Setup
 
 ```bash
-pip install gguf requests tqdm
+pip install gguf requests tqdm datasets
 ```
 
 ### Evaluate different looped layer configurations
