@@ -119,7 +119,7 @@ def print_results_table(results: list[dict], baseline: dict | None = None):
         print("-" * width)
 
     for r in results:
-        config = f"{set(r['repeat_layers'])}x{r['repeat_factor']}"
+        config = "{" + ",".join(map(str, r['repeat_layers'])) + "}" + f"x{r['repeat_factor']}"
         rs = r.get('reasoning_score', 0)
 
         if baseline:
@@ -134,7 +134,8 @@ def print_results_table(results: list[dict], baseline: dict | None = None):
             comb_d = f"{combined:>+11.2f}"
             all_pos = "*" if math_delta > 0 and eq_delta > 0 and reas_delta > 0 else " "
         else:
-            math_d = eq_d = reas_d = comb_d = "---"
+            math_d = eq_d = reas_d = "     ---"
+            comb_d = "        ---"
             all_pos = " "
 
         print(f"{config:>14} "
